@@ -1,0 +1,49 @@
+# Environment variables - consolidated section
+.env
+**/.env
+.env.*
+!.env.example
+
+# Python - consolidated section
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+ENV/
+
+# Outputs and generated files
+outputs/
+**/outputs/
+
+# Allow example files in any folder containing "example" (case insensitive)
+!**/[Ee]xample*/**/*.xlsx
+!**/[Ee]xample*/**/*.csv
+!**/[Ee]xample*/**/*.pdf
+!**/[Ee]xample*/**/*.txt
+!**/[Ee]xample*/**/*.docx
+
+# OS specific files - consolidated section
+.DS_Store
+Thumbs.db
+
+# IDE specific files - consolidated section
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,6 @@
+# Core dependencies
+openai>=1.0.0
+python-dotenv>=0.19.0
+tqdm>=4.62.0
+python-docx>=0.8.11
+tiktoken>=0.3.0 
