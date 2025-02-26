@@ -28,8 +28,11 @@ venv/
 ENV/
 
 # Outputs and generated files
-outputs/
-**/outputs/
+outputs/*
+**/outputs/*
+# But keep the folders themselves with .gitkeep
+!outputs/.gitkeep
+!**/outputs/.gitkeep
 
 # Allow example files in any folder containing "example" (case insensitive)
 !**/[Ee]xample*/**/*.xlsx
