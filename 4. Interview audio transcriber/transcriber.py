@@ -10,6 +10,10 @@ from tqdm import tqdm
 from datetime import datetime
 import time
 import shutil
+import asyncio
+import aiohttp
+from openai import AsyncOpenAI
+from typing import List, Dict, Any
 
 # Load environment variables from .env file
 load_dotenv()
@@ -209,7 +213,10 @@ def split_long_audio(file_path, max_duration_minutes=25):
         print(f"Error splitting audio file: {str(e)}")
         return [file_path]  # Return original file on error
 
-def transcribe_with_whisper(file_path, model="whisper-1", max_retries=3):
+# Initialize OpenAI client
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+async def transcribe_with_whisper(file_path, model="whisper-1", max_retries=3):
     """Transcribe an audio file using OpenAI's Whisper model."""
     try:
         if not os.path.exists(file_path):
@@ -234,39 +241,43 @@ def transcribe_with_whisper(file_path, model="whisper-1", max_retries=3):
                 # Transcribe each chunk and combine
                 all_transcriptions = []
                 
-                for i, chunk_file in enumerate(chunk_files):
-                    print(f"Transcribing chunk {i+1}/{len(chunk_files)}")
-                    
-                    # Check if chunk needs preprocessing
-                    chunk_size = get_audio_file_size(chunk_file)
-                    if chunk_size > 24:
-                        processed_chunk = preprocess_audio(chunk_file)
-                        if not processed_chunk:
-                            print(f"Failed to preprocess chunk {i+1}")
-                            continue
-                        temp_files_to_delete.append(processed_chunk)
-                    else:
-                        processed_chunk = chunk_file
-                    
-                    # Transcribe with retries
-                    for attempt in range(max_retries):
-                        try:
-                            client = OpenAI(api_key=OPENAI_API_KEY)
-                            with open(processed_chunk, "rb") as audio_file:
-                                chunk_transcription = client.audio.transcriptions.create(
-                                    model=model,
-                                    file=audio_file,
-                                    response_format="text"
-                                )
-                            all_transcriptions.append(chunk_transcription)
-                            break
-                        except Exception as e:
-                            if attempt < max_retries - 1:
-                                print(f"Attempt {attempt+1} failed: {str(e)}. Retrying in 5 seconds...")
-                                time.sleep(5)
-                            else:
-                                print(f"All {max_retries} attempts failed for chunk {i+1}: {str(e)}")
-                                all_transcriptions.append(f"[Transcription failed for part {i+1}]")
+                # Process chunks concurrently with semaphore for rate limiting
+                semaphore = asyncio.Semaphore(4)  # Limit concurrent API calls
+                
+                async def process_chunk(chunk_file, chunk_index):
+                    async with semaphore:
+                        print(f"Transcribing chunk {chunk_index+1}/{len(chunk_files)}")
+                        
+                        # Check if chunk needs preprocessing
+                        chunk_size = get_audio_file_size(chunk_file)
+                        if chunk_size > 24:
+                            processed_chunk = preprocess_audio(chunk_file)
+                            if not processed_chunk:
+                                return f"[Failed to preprocess chunk {chunk_index+1}]"
+                            temp_files_to_delete.append(processed_chunk)
+                        else:
+                            processed_chunk = chunk_file
+                        
+                        # Transcribe with retries
+                        for attempt in range(max_retries):
+                            try:
+                                with open(processed_chunk, "rb") as audio_file:
+                                    chunk_transcription = await client.audio.transcriptions.create(
+                                        model=model,
+                                        file=audio_file,
+                                        response_format="text"
+                                    )
+                                return chunk_transcription
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    print(f"Attempt {attempt+1} failed: {str(e)}. Retrying in 5 seconds...")
+                                    await asyncio.sleep(5)
+                                else:
+                                    return f"[Transcription failed for part {chunk_index+1}]"
+                
+                # Process all chunks concurrently
+                tasks = [process_chunk(chunk, i) for i, chunk in enumerate(chunk_files)]
+                all_transcriptions = await asyncio.gather(*tasks)
                 
                 # Clean up temporary chunk files
                 for chunk_file in chunk_files:
@@ -298,12 +309,9 @@ def transcribe_with_whisper(file_path, model="whisper-1", max_retries=3):
         # Transcribe with retries
         for attempt in range(max_retries):
             try:
-                # Initialize OpenAI client
-                client = OpenAI(api_key=OPENAI_API_KEY)
-                
                 # Transcribe the audio
                 with open(processed_file, "rb") as audio_file:
-                    transcription = client.audio.transcriptions.create(
+                    transcription = await client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,
                         response_format="text"
@@ -318,7 +326,7 @@ def transcribe_with_whisper(file_path, model="whisper-1", max_retries=3):
             except Exception as e:
                 if attempt < max_retries - 1:
                     print(f"Attempt {attempt+1} failed: {str(e)}. Retrying in 5 seconds...")
-                    time.sleep(5)
+                    await asyncio.sleep(5)
                 else:
                     # Clean up temporary files on final failure
                     for temp_file in temp_files_to_delete:
@@ -329,7 +337,7 @@ def transcribe_with_whisper(file_path, model="whisper-1", max_retries=3):
         print(f"Error during transcription: {str(e)}")
         return f"Transcription error: {str(e)}"
 
-def summarize_transcript(transcript, model="gpt-4o-mini", max_retries=3):
+async def summarize_transcript(transcript, model="gpt-4o-mini", max_retries=3):
     """Summarize the transcript using OpenAI's chat completions."""
     try:
         if not transcript or transcript.startswith("Transcription error"):
@@ -349,8 +357,7 @@ def summarize_transcript(transcript, model="gpt-4o-mini", max_retries=3):
         # Try with retries
         for attempt in range(max_retries):
             try:
-                client = OpenAI(api_key=OPENAI_API_KEY)
-                response = client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -366,7 +373,7 @@ def summarize_transcript(transcript, model="gpt-4o-mini", max_retries=3):
             except Exception as e:
                 if attempt < max_retries - 1:
                     print(f"Attempt {attempt+1} failed: {str(e)}. Retrying in 5 seconds...")
-                    time.sleep(5)
+                    await asyncio.sleep(5)
                 else:
                     print(f"All {max_retries} attempts failed: {str(e)}")
                     return f"Summarization error: {str(e)}"
@@ -374,7 +381,7 @@ def summarize_transcript(transcript, model="gpt-4o-mini", max_retries=3):
         print(f"Error during summarization: {str(e)}")
         return f"Summarization error: {str(e)}"
 
-def process_audio_file(file_path, output_dir=None, transcription_model="whisper-1", summary_model="gpt-4o-mini", create_summary=True):
+async def process_audio_file(file_path, output_dir=None, transcription_model="whisper-1", summary_model="gpt-4o-mini", create_summary=True):
     """Process a single audio file: transcribe and optionally summarize."""
     try:
         file_name = os.path.basename(file_path)
@@ -392,7 +399,7 @@ def process_audio_file(file_path, output_dir=None, transcription_model="whisper-
         print(f"Processing file: {file_name}")
         
         # Step 1: Transcription
-        transcript = transcribe_with_whisper(file_path, transcription_model)
+        transcript = await transcribe_with_whisper(file_path, transcription_model)
         if transcript.startswith("Transcription error"):
             print(f"Transcription failed for {file_name}: {transcript}")
             
@@ -412,7 +419,7 @@ def process_audio_file(file_path, output_dir=None, transcription_model="whisper-
         
         # Step 2: Summarization (if requested)
         if create_summary:
-            summary = summarize_transcript(transcript, summary_model)
+            summary = await summarize_transcript(transcript, summary_model)
             if summary.startswith("Summarization error"):
                 print(f"Summarization failed for {file_name}: {summary}")
                 
@@ -458,7 +465,7 @@ def process_audio_file(file_path, output_dir=None, transcription_model="whisper-
             
         return False
 
-def process_audio_folder(input_dir, output_dir=None, transcription_model="whisper-1", summary_model="gpt-4o-mini", create_summary=True):
+async def process_audio_folder(input_dir, output_dir=None, transcription_model="whisper-1", summary_model="gpt-4o-mini", create_summary=True):
     """Process all audio files in a folder."""
     try:
         # Validate input directory
@@ -494,22 +501,25 @@ def process_audio_folder(input_dir, output_dir=None, transcription_model="whispe
         for i, file_path in enumerate(audio_files, 1):
             print(f"  {i}. {os.path.basename(file_path)}")
         
-        # Process each file
-        successful = 0
-        failed = 0
+        # Process files concurrently with rate limiting
+        semaphore = asyncio.Semaphore(4)  # Limit concurrent file processing
         
-        for file_path in tqdm(audio_files, desc="Processing audio files"):
-            result = process_audio_file(
-                file_path, 
-                output_dir, 
-                transcription_model, 
-                summary_model, 
-                create_summary
-            )
-            if result:
-                successful += 1
-            else:
-                failed += 1
+        async def process_with_semaphore(file_path):
+            async with semaphore:
+                return await process_audio_file(
+                    file_path, 
+                    output_dir, 
+                    transcription_model, 
+                    summary_model, 
+                    create_summary
+                )
+        
+        # Process all files concurrently
+        tasks = [process_with_semaphore(file_path) for file_path in audio_files]
+        results = await asyncio.gather(*tasks)
+        
+        successful = sum(1 for result in results if result)
+        failed = len(results) - successful
         
         # Create a report
         report_path = os.path.join(output_dir, "transcription_report.txt")
@@ -602,8 +612,8 @@ def get_user_input():
         "create_summary": create_summary
     }
 
-def main():
-    """Main function to run the script."""
+async def async_main():
+    """Async main function to run the script."""
     # Check for dependencies
     if not check_dependencies():
         print("Required dependencies not found. Please install ffmpeg and ffprobe.")
@@ -638,7 +648,7 @@ def main():
                 script_dir = Path(__file__).parent
                 output_dir = script_dir / "Output files"
                 
-            success = process_audio_file(
+            success = await process_audio_file(
                 input_dir,
                 output_dir,
                 transcription_model,
@@ -662,7 +672,7 @@ def main():
         create_summary = user_input["create_summary"]
     
     # Process the folder
-    success = process_audio_folder(
+    success = await process_audio_folder(
         input_dir,
         output_dir,
         transcription_model,
@@ -676,4 +686,4 @@ def main():
         print("\nProcessing failed. Check the log file for details.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())

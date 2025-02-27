@@ -13,6 +13,10 @@ import json
 import time
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import aiohttp
+from openai import AsyncOpenAI
+from typing import List, Dict, Any
 
 
 # Get script directory for relative paths
@@ -54,7 +58,7 @@ class DataManipulator:
     """Class for manipulating data using OpenAI's API."""
     
     def __init__(self, df, input_columns, output_columns, transformation_prompt, 
-                 model="gpt-3.5-turbo", temperature=0.3, batch_size=20, max_workers=4, max_retries=3):
+                 model="gpt-3.5-turbo", temperature=0.3, batch_size=20, max_concurrent=4, max_retries=3):
         """
         Initialize the data manipulator.
         
@@ -66,7 +70,7 @@ class DataManipulator:
             model (str, optional): OpenAI model to use. Defaults to "gpt-3.5-turbo".
             temperature (float, optional): Controls randomness in generation. Defaults to 0.3.
             batch_size (int, optional): Number of rows to process per API call. Defaults to 20.
-            max_workers (int, optional): Max number of parallel workers. Defaults to 4.
+            max_concurrent (int, optional): Max number of concurrent API calls. Defaults to 4.
             max_retries (int, optional): Max number of retries for API calls. Defaults to 3.
         """
         self.df = df
@@ -76,8 +80,9 @@ class DataManipulator:
         self.model = model
         self.temperature = temperature
         self.batch_size = batch_size
-        self.max_workers = max_workers
+        self.max_concurrent = max_concurrent
         self.max_retries = max_retries
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         
         # Create output columns if they don't exist
         for col in output_columns:
@@ -164,9 +169,9 @@ class DataManipulator:
         
         return prompt
     
-    def _process_batch(self, batch_indices):
+    async def _process_batch(self, batch_indices):
         """
-        Process a batch of data rows.
+        Process a batch of data rows asynchronously.
         
         Args:
             batch_indices (list): List of row indices to process.
@@ -178,7 +183,7 @@ class DataManipulator:
         
         for attempt in range(self.max_retries):
             try:
-                response = client.chat.completions.create(
+                response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": self._create_system_prompt()},
@@ -191,13 +196,12 @@ class DataManipulator:
                 content = response.choices[0].message.content
                 
                 try:
-                    # Parse the JSON response
                     data = json.loads(content)
                     
                     if "results" not in data:
                         logging.warning(f"Missing 'results' key in response: {content[:200]}...")
                         if attempt < self.max_retries - 1:
-                            time.sleep(2 ** attempt)  # Exponential backoff
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
                             continue
                         else:
                             return [["Error: Invalid response format"]] * len(batch_indices)
@@ -207,26 +211,19 @@ class DataManipulator:
                     # Validate results
                     if len(results) != len(batch_indices):
                         logging.warning(f"Expected {len(batch_indices)} results, got {len(results)}")
-                        # Try to recover by padding or truncating
                         if len(results) < len(batch_indices):
-                            # Pad with empty results
                             results.extend([[""] * len(self.output_columns)] * (len(batch_indices) - len(results)))
                         else:
-                            # Truncate
                             results = results[:len(batch_indices)]
                     
                     # Ensure each result has the correct number of output values
                     for i, result in enumerate(results):
                         if not isinstance(result, list):
-                            logging.warning(f"Result {i} is not a list: {result}")
                             results[i] = [str(result)] * len(self.output_columns)
                         elif len(result) != len(self.output_columns):
-                            logging.warning(f"Result {i} has wrong number of values: {result}")
                             if len(result) < len(self.output_columns):
-                                # Pad with empty strings
                                 results[i].extend([""] * (len(self.output_columns) - len(result)))
                             else:
-                                # Truncate
                                 results[i] = result[:len(self.output_columns)]
                     
                     return results
@@ -234,7 +231,7 @@ class DataManipulator:
                 except json.JSONDecodeError:
                     logging.error(f"Failed to parse JSON: {content[:200]}...")
                     if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)  # Exponential backoff
+                        await asyncio.sleep(2 ** attempt)
                         continue
                     else:
                         return [["Error: Invalid JSON response"]] * len(batch_indices)
@@ -242,68 +239,73 @@ class DataManipulator:
             except Exception as e:
                 logging.error(f"Error calling API: {str(e)}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    await asyncio.sleep(2 ** attempt)
                     continue
                 else:
                     return [["Error: " + str(e)]] * len(batch_indices)
         
-        # If we get here, all retries failed
         return [["Error: All retries failed"]] * len(batch_indices)
-    
-    def process_data(self):
+
+    async def _process_batches(self, batches):
         """
-        Process all data in the dataframe.
+        Process multiple batches concurrently with rate limiting.
+        
+        Args:
+            batches (list): List of batch indices to process.
+            
+        Returns:
+            list: Results from all batches.
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        
+        async def process_with_semaphore(batch):
+            async with semaphore:
+                return await self._process_batch(batch)
+        
+        tasks = [process_with_semaphore(batch) for batch in batches]
+        return await asyncio.gather(*tasks)
+
+    async def process_data_async(self):
+        """
+        Process all data in the dataframe asynchronously.
         
         Returns:
             pandas.DataFrame: The processed dataframe.
         """
         num_rows = len(self.df)
-        
         logging.info(f"Processing {num_rows} rows...")
         
         # Create batches
         all_indices = list(range(num_rows))
-        batch_count = (num_rows + self.batch_size - 1) // self.batch_size
-        batches = []
+        batches = [
+            all_indices[i:i + self.batch_size]
+            for i in range(0, num_rows, self.batch_size)
+        ]
         
-        for i in range(batch_count):
-            start_idx = i * self.batch_size
-            end_idx = min(start_idx + self.batch_size, num_rows)
-            batches.append(all_indices[start_idx:end_idx])
-        
-        results = []
-        
-        # Process in parallel
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_batch = {executor.submit(self._process_batch, batch): i for i, batch in enumerate(batches)}
+        with tqdm(total=len(batches), desc="Processing batches") as pbar:
+            batch_results = await self._process_batches(batches)
             
-            with tqdm(total=len(batches), desc="Processing batches") as pbar:
-                for future in concurrent.futures.as_completed(future_to_batch):
-                    batch_idx = future_to_batch[future]
-                    batch_indices = batches[batch_idx]
-                    
-                    try:
-                        batch_results = future.result()
-                        
-                        # Store results by row index
-                        for i, row_idx in enumerate(batch_indices):
-                            if i < len(batch_results):
-                                row_result = batch_results[i]
-                                for j, col in enumerate(self.output_columns):
-                                    if j < len(row_result):
-                                        self.df.at[row_idx, col] = row_result[j]
-                    
-                    except Exception as e:
-                        logging.error(f"Error processing batch {batch_idx}: {str(e)}")
-                        # Mark all rows in this batch as errors
-                        for row_idx in batch_indices:
-                            for col in self.output_columns:
-                                self.df.at[row_idx, col] = f"Error: {str(e)}"
-                    
-                    pbar.update(1)
+            # Update the dataframe with results
+            for batch_idx, batch_indices in enumerate(batches):
+                results = batch_results[batch_idx]
+                for i, row_idx in enumerate(batch_indices):
+                    if i < len(results):
+                        for j, col in enumerate(self.output_columns):
+                            if j < len(results[i]):
+                                self.df.at[row_idx, col] = results[i][j]
+                pbar.update(1)
         
         logging.info("Processing complete.")
         return self.df
+
+    def process_data(self):
+        """
+        Synchronous wrapper for process_data_async.
+        
+        Returns:
+            pandas.DataFrame: The processed dataframe.
+        """
+        return asyncio.run(self.process_data_async())
 
 def read_excel_file(file_path):
     """
@@ -524,10 +526,8 @@ def get_user_input():
         "batch_size": batch_size
     }
 
-def main():
-    """Main function to run the script."""
-    import concurrent.futures
-    
+async def async_main():
+    """Async main function to run the script."""
     # Check if command-line arguments are provided
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description='Manipulate data using OpenAI API.')
@@ -601,7 +601,7 @@ def main():
     
     # Process the data
     start_time = time.time()
-    result_df = manipulator.process_data()
+    result_df = await manipulator.process_data_async()
     end_time = time.time()
     
     # Save the result
@@ -630,4 +630,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())

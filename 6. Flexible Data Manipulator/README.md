@@ -4,7 +4,7 @@
 This Python script uses OpenAI's API to transform data in an Excel or CSV file. It reads specified input columns from your file, applies custom transformation instructions (provided as a prompt), and writes the transformed results to new output columns. The tool processes data in batches using parallel processing for efficiency and logs all its activities for troubleshooting.
 
 ## Prerequisites
-- **Python 3:** Make sure you have Python 3 installed.
+- **Python 3.7+:** The script uses asyncio features that require Python 3.7 or newer.
 - **Visual Studio Code (VS Code):** A user-friendly code editor recommended for beginners.
 - **OpenAI API Key:** Sign up at [OpenAI](https://openai.com) to obtain an API key.
 - **Excel/CSV File:** An input file containing your data.
@@ -14,13 +14,14 @@ This Python script uses OpenAI's API to transform data in an Excel or CSV file. 
   - openai
   - python-dotenv
   - tqdm
+  - aiohttp
   - argparse
-  - (Other standard libraries: os, sys, json, time, logging, datetime, concurrent.futures)
+  - (Other standard libraries: os, sys, json, time, logging, datetime, asyncio)
 
 ## Installation
 
 1. **Download or Clone the Repository:**
-   - If you’re new to GitHub, click the "Code" button on the repository page and select "Download ZIP". Extract the ZIP file to a folder on your computer.
+   - If you're new to GitHub, click the "Code" button on the repository page and select "Download ZIP". Extract the ZIP file to a folder on your computer.
 
 2. **Open the Project in VS Code:**
    - Launch VS Code.
@@ -49,7 +50,7 @@ This Python script uses OpenAI's API to transform data in an Excel or CSV file. 
      ```
    - If a `requirements.txt` is not provided, install the required libraries individually:
      ```
-     pip install pandas numpy openai python-dotenv tqdm
+     pip install pandas numpy openai python-dotenv tqdm aiohttp
      ```
 
 ## Setup
@@ -102,14 +103,28 @@ python script_name.py --input path/to/input.xlsx --input-columns "Column1,Column
 - **Custom Data Transformation:**  
   Uses your transformation instructions to process each row. It creates a system prompt and a batch prompt that includes sample examples for consistency.
 
-- **Batch Processing & Parallel Execution:**  
-  Processes data in batches using multithreading (ThreadPoolExecutor) for faster transformation of large datasets.
+- **Asynchronous Processing:**  
+  Uses Python's asyncio for concurrent processing of data batches, significantly improving performance with large datasets. The script maintains rate limiting to avoid overwhelming the API.
+
+- **Batch Processing:**  
+  Processes data in configurable batch sizes with concurrent API calls for optimal performance.
 
 - **Logging:**  
   Records all steps, warnings, and errors in a log file saved in the outputs directory for easy troubleshooting.
 
 - **Output Generation:**  
   Saves the transformed data as an Excel file. A copy of the log file is also saved alongside the output.
+
+## Performance Considerations
+
+- **Batch Size:**  
+  The default batch size is 20 rows per API call. You can adjust this based on your data characteristics and API rate limits.
+
+- **Concurrent Processing:**  
+  The script processes multiple batches concurrently while respecting API rate limits. The default maximum concurrent API calls is 4, but you can adjust this based on your API tier and requirements.
+
+- **Memory Usage:**  
+  For very large files, the script loads the entire dataset into memory. If you're processing extremely large files, consider implementing chunked reading.
 
 ## Troubleshooting
 

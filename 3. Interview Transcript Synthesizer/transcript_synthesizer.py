@@ -1,7 +1,9 @@
 import os
 import sys
 import docx
-import openai
+import asyncio
+import aiohttp
+from openai import AsyncOpenAI
 import argparse
 from pathlib import Path
 from dotenv import load_dotenv
@@ -20,7 +22,7 @@ if not api_key:
     sys.exit(1)
 
 # Initialize OpenAI client
-client = openai.OpenAI(api_key=api_key)
+client = AsyncOpenAI(api_key=api_key)
 
 def read_text_file(file_path):
     """Read content from a text file."""
@@ -98,7 +100,7 @@ def chunk_text(text, max_tokens=3000, model="gpt-4"):
         
     return chunks
 
-def analyze_transcript(transcript, file_name, model="gpt-4"):
+async def analyze_transcript(transcript, file_name, model="gpt-4"):
     """Analyze a transcript using OpenAI API."""
     # Check if transcript is empty or contains error message
     if not transcript.strip() or transcript.startswith("Error reading file:"):
@@ -112,34 +114,42 @@ def analyze_transcript(transcript, file_name, model="gpt-4"):
         chunks = chunk_text(transcript, 3000, model)
         chunk_analyses = []
         
-        for i, chunk in enumerate(tqdm(chunks, desc="  Processing chunks")):
-            chunk_prompt = f"""
-            You are analyzing part {i+1} of {len(chunks)} of an expert interview transcript. The file name is {file_name}.
-            For this chunk, extract:
-            
-            1. Key points
-            2. Notable quotes (with proper attribution)
-            3. Emerging themes
-            
-            Format your response in markdown.
-            
-            Here is the transcript chunk:
-            {chunk}
-            """
-            
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": "You are an expert at analyzing interview transcripts and extracting key information."},
-                        {"role": "user", "content": chunk_prompt}
-                    ],
-                    max_tokens=1000
-                )
-                chunk_analyses.append(response.choices[0].message.content)
-            except Exception as e:
-                print(f"  Error analyzing chunk {i+1} of {file_name}: {e}")
-                chunk_analyses.append(f"Error analyzing chunk {i+1}: {e}")
+        # Process chunks concurrently with rate limiting
+        semaphore = asyncio.Semaphore(4)  # Limit concurrent API calls
+        
+        async def process_chunk(chunk, chunk_index):
+            async with semaphore:
+                chunk_prompt = f"""
+                You are analyzing part {chunk_index+1} of {len(chunks)} of an expert interview transcript. The file name is {file_name}.
+                For this chunk, extract:
+                
+                1. Key points
+                2. Notable quotes (with proper attribution)
+                3. Emerging themes
+                
+                Format your response in markdown.
+                
+                Here is the transcript chunk:
+                {chunk}
+                """
+                
+                try:
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "You are an expert at analyzing interview transcripts and extracting key information."},
+                            {"role": "user", "content": chunk_prompt}
+                        ],
+                        max_tokens=1000
+                    )
+                    return response.choices[0].message.content
+                except Exception as e:
+                    print(f"  Error analyzing chunk {chunk_index+1} of {file_name}: {e}")
+                    return f"Error analyzing chunk {chunk_index+1}: {e}"
+        
+        # Process all chunks concurrently
+        tasks = [process_chunk(chunk, i) for i, chunk in enumerate(chunks)]
+        chunk_analyses = await asyncio.gather(*tasks)
         
         # Now synthesize the chunk analyses
         synthesis_prompt = f"""
@@ -157,7 +167,7 @@ def analyze_transcript(transcript, file_name, model="gpt-4"):
         """
         
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": "You are an expert at synthesizing information from interview analyses."},
@@ -187,7 +197,7 @@ def analyze_transcript(transcript, file_name, model="gpt-4"):
         """
         
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": "You are an expert at analyzing interview transcripts and extracting key information."},
@@ -200,172 +210,67 @@ def analyze_transcript(transcript, file_name, model="gpt-4"):
             print(f"  Error analyzing transcript {file_name}: {e}")
             return f"# Error Analyzing {file_name}\n\nAn error occurred during analysis: {e}"
 
-def create_overall_synthesis(all_analyses, model="gpt-4"):
-    """Create an overall synthesis of all interviews."""
-    combined_analyses = "\n\n".join(all_analyses)
+async def create_overall_synthesis(analyses, model="gpt-4"):
+    """Create an overall synthesis of all interview analyses."""
+    synthesis_prompt = f"""
+    You are synthesizing analyses from multiple expert interviews.
+    Based on these {len(analyses)} interview analyses, provide:
     
-    # Check token count and chunk if necessary
-    token_count = count_tokens(combined_analyses, model)
+    1. An executive summary (200-300 words)
+    2. Key themes across all interviews
+    3. Notable insights and patterns
+    4. Important contrasts or differences in perspectives
     
-    if token_count > 6000:
-        print(f"Combined analyses are long ({token_count} tokens). Processing in stages...")
-        
-        # First, extract key points from each analysis
-        extraction_prompt = f"""
-        You are extracting the most important information from multiple interview analyses.
-        For each analysis, extract:
-        
-        1. The 2-3 most important points
-        2. The 1-2 most insightful quotes
-        3. The main theme
-        
-        Keep your response concise but include all critical insights.
-        
-        Here are the analyses:
-        {combined_analyses}
-        """
-        
-        try:
-            extraction_response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are an expert at extracting key information from lengthy documents."},
-                    {"role": "user", "content": extraction_prompt}
-                ],
-                max_tokens=2000
-            )
-            
-            extracted_content = extraction_response.choices[0].message.content
-            
-            # Now synthesize the extracted content
-            synthesis_prompt = f"""
-            You are synthesizing extracted information from multiple expert interview analyses. 
-            Please create an overall synthesis that includes:
-            
-            1. Executive Summary (250-300 words)
-            2. Major Themes Across Interviews (3-5 themes)
-            3. Notable Quotes (select the 5-7 most insightful quotes)
-            4. Conclusions and Recommendations
-            
-            Format your response in markdown with clear headings for each section.
-            
-            Here is the extracted information:
-            {extracted_content}
-            """
-            
-            synthesis_response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are an expert at synthesizing information from multiple interviews and creating insightful summaries."},
-                    {"role": "user", "content": synthesis_prompt}
-                ],
-                max_tokens=1500
-            )
-            
-            return synthesis_response.choices[0].message.content
-            
-        except Exception as e:
-            print(f"Error creating staged synthesis: {e}")
-            return f"# Error Creating Overall Synthesis\n\nAn error occurred: {e}"
+    Format your response in markdown with clear headings for each section.
     
-    else:
-        # Process normally
-        prompt = f"""
-        You are synthesizing multiple expert interview analyses. 
-        Please create an overall synthesis that includes:
-        
-        1. Executive Summary (250-300 words)
-        2. Major Themes Across Interviews (3-5 themes)
-        3. Notable Quotes (select the 5-7 most insightful quotes)
-        4. Conclusions and Recommendations
-        
-        Format your response in markdown with clear headings for each section.
-        
-        Here are the individual analyses:
-        {combined_analyses}
-        """
-        
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are an expert at synthesizing information from multiple interviews and creating insightful summaries."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=1500
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error creating overall synthesis: {e}")
-            return f"# Error Creating Overall Synthesis\n\nAn error occurred: {e}"
+    Here are the individual analyses:
+    {"".join(analyses)}
+    """
+    
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are an expert at synthesizing information from multiple interview analyses."},
+                {"role": "user", "content": synthesis_prompt}
+            ],
+            max_tokens=2000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error creating overall synthesis: {e}")
+        return f"# Error Creating Overall Synthesis\n\nAn error occurred: {e}"
 
-def get_user_input():
-    """Get input from the user interactively."""
-    print("\n=== Interview Transcript Synthesizer ===\n")
+async def process_transcripts(transcript_files, model):
+    """Process multiple transcripts concurrently."""
+    semaphore = asyncio.Semaphore(4)  # Limit concurrent processing
     
-    # Get folder path
-    while True:
-        folder_path = input("Enter the path to the folder containing interview transcripts: ").strip()
-        if os.path.isdir(folder_path):
-            break
-        else:
-            print(f"Error: '{folder_path}' is not a valid directory. Please try again.")
+    async def process_file(file_path):
+        async with semaphore:
+            file_name = os.path.basename(file_path)
+            print(f"\nAnalyzing {file_name}...")
+            
+            try:
+                transcript = read_file(file_path)
+                preview = transcript[:100].replace('\n', ' ').strip()
+                print(f"  Preview: {preview}...")
+                
+                if not transcript.strip():
+                    print(f"  Warning: {file_name} appears to be empty.")
+                    return f"# Error Analyzing {file_name}\n\nThe transcript appears to be empty."
+                
+                analysis = await analyze_transcript(transcript, file_name, model)
+                print(f"Completed analysis of {file_name}")
+                return analysis
+            except Exception as e:
+                print(f"Error processing {file_name}: {e}")
+                return f"# Error Processing {file_name}\n\nAn error occurred: {e}"
     
-    # Get output file path (optional)
-    output_path = input("Enter the path for the output file (leave blank for default): ").strip()
-    
-    # Get model - expanded options
-    available_models = ["gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
-    print("\nAvailable models:")
-    for i, model in enumerate(available_models, 1):
-        print(f"{i}. {model}")
-    
-    while True:
-        model_choice = input(f"Select a model (1-{len(available_models)}, default is 1): ").strip()
-        if not model_choice:
-            model = available_models[0]
-            break
-        try:
-            model_index = int(model_choice) - 1
-            if 0 <= model_index < len(available_models):
-                model = available_models[model_index]
-                break
-            else:
-                print(f"Please enter a number between 1 and {len(available_models)}.")
-        except ValueError:
-            print("Please enter a valid number.")
-    
-    # Get output format
-    print("\nAvailable output formats:")
-    print("1. Markdown (.md)")
-    print("2. Word Document (.docx)")
-    
-    while True:
-        format_choice = input("Select an output format (1-2, default is 1): ").strip()
-        if not format_choice:
-            output_format = "md"
-            break
-        try:
-            format_index = int(format_choice)
-            if format_index == 1:
-                output_format = "md"
-                break
-            elif format_index == 2:
-                output_format = "docx"
-                break
-            else:
-                print("Please enter either 1 or 2.")
-        except ValueError:
-            print("Please enter a valid number.")
-    
-    return {
-        "folder_path": folder_path,
-        "output_path": output_path,
-        "model": model,
-        "output_format": output_format
-    }
+    analyses = await asyncio.gather(*[process_file(file_path) for file_path in transcript_files])
+    return analyses
 
-def main():
+async def async_main():
+    """Async main function to run the script."""
     # Check if command-line arguments are provided
     if len(sys.argv) > 1:
         # Use argparse for command-line arguments
@@ -411,38 +316,14 @@ def main():
     for i, file_path in enumerate(transcript_files, 1):
         print(f"  {i}. {os.path.basename(file_path)}")
     
-    # Analyze each transcript
-    all_analyses = []
-    individual_analyses = []
-    
-    for file_path in tqdm(transcript_files, desc="Analyzing transcripts"):
-        file_name = os.path.basename(file_path)
-        print(f"\nAnalyzing {file_name}...")
-        
-        try:
-            # Read the transcript and print the first 100 characters for debugging
-            transcript = read_file(file_path)
-            preview = transcript[:100].replace('\n', ' ').strip()
-            print(f"  Preview: {preview}...")
-            
-            # Check if transcript is empty
-            if not transcript.strip():
-                print(f"  Warning: {file_name} appears to be empty.")
-                analysis = f"# Error Analyzing {file_name}\n\nThe transcript appears to be empty."
-            else:
-                analysis = analyze_transcript(transcript, file_name, model)
-            
-            individual_analyses.append(analysis)
-            all_analyses.append(f"# Analysis of {file_name}\n\n{analysis}\n\n---\n\n")
-            
-            print(f"Completed analysis of {file_name}")
-        except Exception as e:
-            print(f"Error processing {file_name}: {e}")
-            all_analyses.append(f"# Error Processing {file_name}\n\nAn error occurred: {e}\n\n---\n\n")
+    # Analyze transcripts concurrently
+    individual_analyses = await process_transcripts(transcript_files, model)
+    all_analyses = [f"# Analysis of {os.path.basename(f)}\n\n{a}\n\n---\n\n" 
+                   for f, a in zip(transcript_files, individual_analyses)]
     
     # Create overall synthesis
     print("\nCreating overall synthesis...")
-    overall_synthesis = create_overall_synthesis(individual_analyses, model)
+    overall_synthesis = await create_overall_synthesis(individual_analyses, model)
     
     # Combine everything into final document
     final_document = f"""# Interview Transcript Synthesis
@@ -546,5 +427,71 @@ Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     
     print(f"\nAnalysis complete! Results saved to {final_output_path}")
 
+def get_user_input():
+    """Get input from the user interactively."""
+    print("\n=== Interview Transcript Synthesizer ===\n")
+    
+    # Get folder path
+    while True:
+        folder_path = input("Enter the path to the folder containing interview transcripts: ").strip()
+        if os.path.isdir(folder_path):
+            break
+        else:
+            print(f"Error: '{folder_path}' is not a valid directory. Please try again.")
+    
+    # Get output file path (optional)
+    output_path = input("Enter the path for the output file (leave blank for default): ").strip()
+    
+    # Get model - expanded options
+    available_models = ["gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
+    print("\nAvailable models:")
+    for i, model in enumerate(available_models, 1):
+        print(f"{i}. {model}")
+    
+    while True:
+        model_choice = input(f"Select a model (1-{len(available_models)}, default is 1): ").strip()
+        if not model_choice:
+            model = available_models[0]
+            break
+        try:
+            model_index = int(model_choice) - 1
+            if 0 <= model_index < len(available_models):
+                model = available_models[model_index]
+                break
+            else:
+                print(f"Please enter a number between 1 and {len(available_models)}.")
+        except ValueError:
+            print("Please enter a valid number.")
+    
+    # Get output format
+    print("\nAvailable output formats:")
+    print("1. Markdown (.md)")
+    print("2. Word Document (.docx)")
+    
+    while True:
+        format_choice = input("Select an output format (1-2, default is 1): ").strip()
+        if not format_choice:
+            output_format = "md"
+            break
+        try:
+            format_index = int(format_choice)
+            if format_index == 1:
+                output_format = "md"
+                break
+            elif format_index == 2:
+                output_format = "docx"
+                break
+            else:
+                print("Please enter either 1 or 2.")
+        except ValueError:
+            print("Please enter a valid number.")
+    
+    return {
+        "folder_path": folder_path,
+        "output_path": output_path,
+        "model": model,
+        "output_format": output_format
+    }
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())

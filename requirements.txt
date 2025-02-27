@@ -12,4 +12,9 @@ backoff>=2.0.0
 
 # Interview Transcript Synthesizer specific dependencies
 python-docx>=0.8.11
-tiktoken>=0.3.0 
+tiktoken>=0.3.0
+
+# New dependencies from the code block
+aiohttp>=3.8.0
+asyncio>=3.4.3
+openpyxl>=3.0.9 

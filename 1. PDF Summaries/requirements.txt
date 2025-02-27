@@ -1,4 +1,6 @@
-python-dotenv
-openai
-PyPDF2
-backoff 
+python-dotenv>=0.19.0
+openai>=1.0.0
+PyPDF2>=3.0.0
+backoff>=2.2.1
+aiohttp>=3.8.0
+aiofiles>=23.1.0 
