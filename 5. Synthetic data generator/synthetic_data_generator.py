@@ -12,6 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import logging
 import datetime
+import asyncio
+import aiohttp
+from openai import AsyncOpenAI
+from typing import List, Dict, Any
 
 # Get script directory for relative paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,9 +50,9 @@ if not OPENAI_API_KEY:
     sys.exit(1)
 
 # Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-def generate_schema_from_prompt(prompt, model="gpt-4o"):
+async def generate_schema_from_prompt(prompt, model="gpt-4o"):
     """
     Generate column names and example data based on a user prompt.
     
@@ -73,7 +77,7 @@ def generate_schema_from_prompt(prompt, model="gpt-4o"):
     """
     
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -119,7 +123,7 @@ class SyntheticDataGenerator:
     """Class for generating synthetic data using OpenAI's API."""
     
     def __init__(self, column_names, example_rows=None, model="gpt-4o-mini", 
-                 temperature=0.7, batch_size=25, max_workers=4, max_retries=3):
+                 temperature=0.7, batch_size=25, max_concurrent=4, max_retries=3):
         """
         Initialize the synthetic data generator.
         
@@ -129,7 +133,7 @@ class SyntheticDataGenerator:
             model (str, optional): OpenAI model to use. Defaults to "gpt-4o-mini".
             temperature (float, optional): Controls randomness in generation. Defaults to 0.7.
             batch_size (int, optional): Number of rows to generate per API call. Defaults to 25.
-            max_workers (int, optional): Max number of parallel workers. Defaults to 4.
+            max_concurrent (int, optional): Max number of concurrent API calls. Defaults to 4.
             max_retries (int, optional): Max number of retries for API calls. Defaults to 3.
         """
         self.column_names = column_names
@@ -137,8 +141,9 @@ class SyntheticDataGenerator:
         self.model = model
         self.temperature = temperature
         self.batch_size = batch_size
-        self.max_workers = max_workers
+        self.max_concurrent = max_concurrent
         self.max_retries = max_retries
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         self.data_format_instructions = ""
         
         # Determine data types and format from example rows
@@ -241,7 +246,7 @@ class SyntheticDataGenerator:
         
         return prompt
         
-    def _generate_batch(self, batch_size, existing_data=None):
+    async def _generate_batch(self, batch_size, existing_data=None):
         """
         Generate a batch of synthetic data rows.
         
@@ -256,7 +261,7 @@ class SyntheticDataGenerator:
         
         for attempt in range(self.max_retries):
             try:
-                response = client.chat.completions.create(
+                response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": "You are a synthetic data generator that creates realistic sample data based on the provided columns and examples. Always return data in the exact format requested."},
@@ -269,10 +274,8 @@ class SyntheticDataGenerator:
                 content = response.choices[0].message.content
                 
                 try:
-                    # Parse the JSON response
                     data = json.loads(content)
                     
-                    # Handle different possible JSON structures
                     if isinstance(data, list):
                         return data
                     elif "data" in data:
@@ -280,33 +283,64 @@ class SyntheticDataGenerator:
                     elif "rows" in data:
                         return data["rows"]
                     else:
-                        # Try to find any array in the response
                         for key, value in data.items():
                             if isinstance(value, list) and len(value) > 0:
                                 return value
                                 
                         logging.warning(f"Unexpected JSON structure: {content[:200]}...")
-                        continue
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
                         
                 except json.JSONDecodeError:
                     logging.warning(f"Failed to parse JSON on attempt {attempt+1}: {content[:200]}...")
                     if attempt < self.max_retries - 1:
-                        time.sleep(2)
-                    continue
+                        await asyncio.sleep(2 ** attempt)
+                        continue
                     
             except Exception as e:
                 logging.warning(f"API call failed on attempt {attempt+1}: {str(e)}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(2)
-                continue
+                    await asyncio.sleep(2 ** attempt)
+                    continue
                 
-        # If all attempts failed, return empty list
         logging.error(f"All {self.max_retries} attempts to generate batch failed.")
         return []
-        
-    def generate_data(self, num_rows):
+
+    async def _generate_batches(self, num_rows, existing_data=None):
         """
-        Generate synthetic data.
+        Generate multiple batches concurrently with rate limiting.
+        
+        Args:
+            num_rows (int): Total number of rows to generate.
+            existing_data (list, optional): Previously generated data for consistency.
+            
+        Returns:
+            list: All generated rows.
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        
+        async def generate_with_semaphore(size, data):
+            async with semaphore:
+                return await self._generate_batch(size, data)
+        
+        # Calculate batch sizes
+        full_batches = num_rows // self.batch_size
+        remainder = num_rows % self.batch_size
+        batch_sizes = [self.batch_size] * full_batches
+        if remainder:
+            batch_sizes.append(remainder)
+        
+        # Create tasks for all batches
+        tasks = [generate_with_semaphore(size, existing_data) for size in batch_sizes]
+        results = await asyncio.gather(*tasks)
+        
+        # Flatten results
+        return [row for batch in results for row in batch]
+
+    async def generate_data_async(self, num_rows):
+        """
+        Generate synthetic data asynchronously.
         
         Args:
             num_rows (int): Number of rows to generate.
@@ -316,69 +350,41 @@ class SyntheticDataGenerator:
         """
         logging.info(f"Generating {num_rows} rows of synthetic data...")
         
-        # Calculate number of batches
-        num_batches = (num_rows + self.batch_size - 1) // self.batch_size
+        # Generate first batch to use as examples
+        first_batch_size = min(self.batch_size, num_rows)
+        first_batch = await self._generate_batch(first_batch_size)
+        all_rows = first_batch
         
-        # Generate in batches
-        all_rows = []
+        # Generate remaining rows if needed
+        if num_rows > first_batch_size:
+            remaining_rows = num_rows - len(first_batch)
+            remaining_data = await self._generate_batches(remaining_rows, first_batch)
+            all_rows.extend(remaining_data)
         
-        # Generate first batch to serve as examples for later batches
-        if num_batches > 0:
-            first_batch_size = min(self.batch_size, num_rows)
-            first_batch = self._generate_batch(first_batch_size)
-            all_rows.extend(first_batch)
-            logging.info(f"Generated first batch: {len(first_batch)} rows")
-            
-        # Generate remaining batches in parallel
-        if num_batches > 1:
-            remaining_rows = num_rows - len(all_rows)
-            remaining_batches = (remaining_rows + self.batch_size - 1) // self.batch_size
-            
-            batch_sizes = [self.batch_size] * remaining_batches
-            # Adjust last batch size if needed
-            if remaining_rows % self.batch_size != 0:
-                batch_sizes[-1] = remaining_rows % self.batch_size
-                
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Create a copy of existing data for each worker
-                existing_data = all_rows.copy()
-                
-                # Submit batch generation tasks
-                future_to_batch = {
-                    executor.submit(self._generate_batch, size, existing_data): i 
-                    for i, size in enumerate(batch_sizes)
-                }
-                
-                # Process completed batches
-                for future in tqdm(future_to_batch, desc="Generating batches", total=len(batch_sizes)):
-                    batch_idx = future_to_batch[future]
-                    try:
-                        batch_rows = future.result()
-                        all_rows.extend(batch_rows)
-                        logging.info(f"Generated batch {batch_idx+1}/{len(batch_sizes)}: {len(batch_rows)} rows")
-                    except Exception as e:
-                        logging.error(f"Error generating batch {batch_idx+1}: {str(e)}")
-        
-        # Ensure we have the right number of rows
-        if len(all_rows) > num_rows:
-            all_rows = all_rows[:num_rows]
-            
-        # Convert to DataFrame
+        # Ensure correct number of rows and create DataFrame
         if all_rows:
-            # Ensure each row has the correct number of elements
-            valid_rows = [row for row in all_rows if len(row) == len(self.column_names)]
+            # Filter valid rows
+            valid_rows = [row for row in all_rows[:num_rows] if len(row) == len(self.column_names)]
             if len(valid_rows) < len(all_rows):
                 logging.warning(f"Filtered out {len(all_rows) - len(valid_rows)} rows with incorrect number of elements.")
-                
+            
             if valid_rows:
-                df = pd.DataFrame(valid_rows, columns=self.column_names)
-                return df
-            else:
-                logging.error("No valid rows generated.")
-                return pd.DataFrame(columns=self.column_names)
-        else:
-            logging.error("Failed to generate any data.")
-            return pd.DataFrame(columns=self.column_names)
+                return pd.DataFrame(valid_rows, columns=self.column_names)
+        
+        logging.error("Failed to generate valid data.")
+        return pd.DataFrame(columns=self.column_names)
+
+    def generate_data(self, num_rows):
+        """
+        Synchronous wrapper for generate_data_async.
+        
+        Args:
+            num_rows (int): Number of rows to generate.
+            
+        Returns:
+            pandas.DataFrame: The generated synthetic data.
+        """
+        return asyncio.run(self.generate_data_async(num_rows))
 
 def read_excel_structure(file_path):
     """
@@ -403,7 +409,7 @@ def read_excel_structure(file_path):
         logging.error(f"Error reading Excel file: {str(e)}")
         return None, None
 
-def get_user_input():
+async def get_user_input():
     """
     Get input from the user interactively.
     
@@ -475,7 +481,7 @@ def get_user_input():
         schema_model = "gpt-4o"  # Default to the most capable model for schema generation
         
         # Generate schema
-        column_names, example_rows = generate_schema_from_prompt(data_description, schema_model)
+        column_names, example_rows = await generate_schema_from_prompt(data_description, schema_model)
         
         if not column_names:
             print("Failed to generate schema from description. Please try again with a more detailed description.")
@@ -617,9 +623,8 @@ def get_user_input():
         "batch_size": batch_size
     }
 
-def main():
-    """Main function to run the script."""
-    # Check if command-line arguments are provided
+async def async_main():
+    """Async main function to run the script."""
     if len(sys.argv) > 1:
         # Use argparse for command-line arguments
         parser = argparse.ArgumentParser(description='Generate synthetic data using OpenAI API.')
@@ -639,7 +644,7 @@ def main():
         
         if args.prompt:
             # Generate schema from prompt
-            column_names, example_rows = generate_schema_from_prompt(args.prompt)
+            column_names, example_rows = await generate_schema_from_prompt(args.prompt)
             if not column_names:
                 print("Error: Failed to generate schema from prompt.")
                 sys.exit(1)
@@ -672,7 +677,7 @@ def main():
         batch_size = args.batch_size
     else:
         # Get input interactively
-        user_input = get_user_input()
+        user_input = await get_user_input()
         column_names = user_input["column_names"]
         example_rows = user_input["example_rows"]
         num_rows = user_input["num_rows"]
@@ -692,7 +697,7 @@ def main():
     
     # Generate data
     start_time = time.time()
-    data = generator.generate_data(num_rows)
+    data = await generator.generate_data_async(num_rows)
     end_time = time.time()
     
     # Save to Excel
@@ -718,4 +723,4 @@ def main():
         print(f"Log file location: {log_file}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())

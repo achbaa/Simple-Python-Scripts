@@ -2,14 +2,15 @@ import os
 import pandas as pd
 import openpyxl
 from dotenv import load_dotenv
-import openai
+import asyncio
+from openai import AsyncOpenAI
 import time
 from pathlib import Path
 import argparse
 import re
 
-def categorize_batch(client, batch_data, system_prompt, user_prompt_template, model="gpt-4o-mini"):
-    """Process a batch of items at once using the OpenAI API"""
+async def categorize_batch(client, batch_data, system_prompt, user_prompt_template, model="gpt-4o-mini"):
+    """Process a batch of items asynchronously using the OpenAI API"""
     try:
         # Create a numbered list of items for clear identification
         numbered_items = []
@@ -20,7 +21,7 @@ def categorize_batch(client, batch_data, system_prompt, user_prompt_template, mo
         batch_text = "\n\n".join(numbered_items)
         
         # Make a single API call for the batch with optimized prompt
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -49,7 +50,7 @@ def categorize_batch(client, batch_data, system_prompt, user_prompt_template, mo
             # Clean up any item numbers or prefixes
             cleaned_categories = []
             for category in categories:
-                # Remove item numbers if present (e.g., "ITEM 1: " or "1. " or "1) ")
+                # Remove item numbers if present
                 category = re.sub(r'^(ITEM\s+\d+:|\d+[.)])\s*', '', category).strip()
                 # Remove any quotes, periods at the end, etc.
                 category = category.strip('"\'.,;:').strip()
@@ -60,17 +61,33 @@ def categorize_batch(client, batch_data, system_prompt, user_prompt_template, mo
         # If we got fewer categories than items, pad with empty strings
         while len(categories) < len(batch_data):
             categories.append("")
-        
-        # If we got more categories than items, truncate
-        categories = categories[:len(batch_data)]
-        
+            
         return categories
+        
     except Exception as e:
-        print(f"Error in batch processing: {str(e)}")
-        # Return empty categories on error
-        return [""] * len(batch_data)
+        print(f"Error processing batch: {str(e)}")
+        return ["Error: " + str(e)] * len(batch_data)
 
-def main():
+async def process_batches(client, data, batch_size, system_prompt, user_prompt_template, model, max_concurrent=4):
+    """Process multiple batches concurrently with rate limiting"""
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_with_semaphore(batch):
+        async with semaphore:
+            return await categorize_batch(client, batch, system_prompt, user_prompt_template, model)
+    
+    # Split data into batches
+    batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
+    
+    # Process all batches concurrently
+    tasks = [process_with_semaphore(batch) for batch in batches]
+    results = await asyncio.gather(*tasks)
+    
+    # Flatten results
+    return [cat for batch_result in results for cat in batch_result]
+
+async def async_main():
+    """Async main function to run the script."""
     # Set up argument parser for quick mode
     parser = argparse.ArgumentParser(description="Excel Data Categorization Tool")
     parser.add_argument("--quick", action="store_true", help="Run in quick mode with default settings")
@@ -94,8 +111,8 @@ def main():
         print("Error: OPENAI_API_KEY not found in .env file.")
         return
     
-    # Set up OpenAI client
-    client = openai.OpenAI(api_key=api_key)
+    # Initialize OpenAI client
+    client = AsyncOpenAI(api_key=api_key)
     
     # Get file path
     file_path = args.file if args.file else input("Enter the path to your Excel file: ")
@@ -293,77 +310,70 @@ def main():
         skipped_count = 0
         error_count = 0
         
-        # Process rows in batches
+        # Collect all data to process
+        all_data = []
+        row_map = []  # Keep track of which rows to update
+        
         current_row = start_row
         while current_row <= max_row:
-            # Prepare batch
-            batch_end = min(current_row + batch_size - 1, max_row)
-            batch_rows = list(range(current_row, batch_end + 1))
-            batch_data = []
-            batch_row_map = []  # To keep track of which rows to update
+            cell_value = sheet[f"{source_col}{current_row}"].value
+            target_cell = sheet[f"{target_col}{current_row}"]
             
-            for row_num in batch_rows:
-                cell_value = sheet[f"{source_col}{row_num}"].value
-                target_cell = sheet[f"{target_col}{row_num}"]
+            # Skip if target cell already has a value
+            if target_cell.value:
+                print(f"Row {current_row}/{max_row}: Skipped (target cell already has value)")
+                skipped_count += 1
+            elif cell_value:
+                all_data.append(cell_value)
+                row_map.append(current_row)
+            else:
+                print(f"Row {current_row}/{max_row}: Empty cell, skipping")
+                skipped_count += 1
+            
+            current_row += 1
+        
+        if all_data:
+            try:
+                # Process all data concurrently in batches
+                categories = await process_batches(
+                    client,
+                    all_data,
+                    batch_size,
+                    system_prompt,
+                    user_prompt_template,
+                    model
+                )
                 
-                # Skip if target cell already has a value
-                if target_cell.value:
-                    print(f"Row {row_num}/{max_row}: Skipped (target cell already has value)")
-                    skipped_count += 1
-                    continue
+                # Update cells with categories
+                for i, row_num in enumerate(row_map):
+                    if i < len(categories):
+                        category = categories[i]
+                        
+                        # Validate against allowed categories if specified
+                        if allowed_categories and category and category not in allowed_categories:
+                            # Try to find the closest match
+                            closest_match = min(allowed_categories, key=lambda x: abs(len(x) - len(category)))
+                            print(f"Row {row_num}/{max_row}: Warning - '{category}' not in allowed categories, using '{closest_match}' instead")
+                            category = closest_match
+                        
+                        sheet[f"{target_col}{row_num}"] = category
+                        processed_count += 1
+                        print(f"Row {row_num}/{max_row}: Categorized as '{category}'")
+                    else:
+                        error_count += 1
+                        print(f"Row {row_num}/{max_row}: Error - no category returned")
+                    
+                    # Save periodically
+                    if (i + 1) % (batch_size * 5) == 0:
+                        workbook.save(output_file_path)
+                        print(f"Progress saved at row {row_num}/{max_row}")
                 
-                if cell_value:
-                    batch_data.append(cell_value)
-                    batch_row_map.append(row_num)
-                else:
-                    print(f"Row {row_num}/{max_row}: Empty cell, skipping")
-                    skipped_count += 1
-            
-            # Process batch if there's data
-            if batch_data:
-                try:
-                    # Process the batch
-                    categories = categorize_batch(client, batch_data, system_prompt, user_prompt_template, model)
-                    
-                    # Update cells with categories
-                    for i, row_num in enumerate(batch_row_map):
-                        if i < len(categories):
-                            category = categories[i]
-                            
-                            # Validate against allowed categories if specified
-                            if allowed_categories and category and category not in allowed_categories:
-                                # Try to find the closest match
-                                closest_match = min(allowed_categories, key=lambda x: abs(len(x) - len(category)))
-                                print(f"Row {row_num}/{max_row}: Warning - '{category}' not in allowed categories, using '{closest_match}' instead")
-                                category = closest_match
-                            
-                            sheet[f"{target_col}{row_num}"] = category
-                            processed_count += 1
-                            print(f"Row {row_num}/{max_row}: Categorized as '{category}'")
-                        else:
-                            error_count += 1
-                            print(f"Row {row_num}/{max_row}: Error - no category returned")
-                    
-                except Exception as e:
-                    print(f"Error processing batch: {str(e)}")
-                    error_count += len(batch_data)
-            
-            # Move to next batch
-            current_row = batch_end + 1
-            
-            # Save periodically
-            if current_row % (batch_size * 5) == 0 or current_row > max_row:
-                if save_to_new_file:
-                    workbook.save(output_file_path)
-                else:
-                    workbook.save(file_path)
-                print(f"Progress saved at row {current_row-1}/{max_row}")
+            except Exception as e:
+                print(f"Error processing data: {str(e)}")
+                error_count += len(all_data)
         
         # Final save
-        if save_to_new_file:
-            workbook.save(output_file_path)
-        else:
-            workbook.save(file_path)
+        workbook.save(output_file_path)
         
         # Print summary
         print("\nCategorization complete!")
@@ -378,4 +388,4 @@ def main():
         print(f"An error occurred: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())
