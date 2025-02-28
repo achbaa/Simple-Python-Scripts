@@ -31,10 +31,10 @@ You can find the tutorial linked [here](https://bcgcloud-my.sharepoint.com/:v:/g
 As you continue to push your limits, remember:
 
 - **ChatGPT doesn't know everything...**  
-  - Even if you're not familiar with the code, share what you can with ChatGPT about the issue you're facing, what you're seeing (screenshots!), and any context you may be able to provide about the data or broader ask.
+  - Even if you're not familiar with the code, share what you can with ChatGPT about the issue you're facing, what you're seeing (screenshots!), and any context you may be able to provide about the data, your desired intent, or the broader project.
 
 - **...ChatGPT does know a lot**  
-  - Your time within the Python documentation should be limited. When faced with an issue, no matter how big or small, don't be afraid to ask ChatGPT.
+  - Your goals should be 1. Solve your problem and 2. Spend as little time in Python documentation as possible. When faced with an issue, no matter how big or small, don't be afraid to ask ChatGPT. 
 
 - **Sometimes it is not just copy and paste**  
   - You can save yourself iteration cycles by either looking at whatever code is being passed back to you **or** you can ask ChatGPT to explain what the code is doing in parts and what purpose each part is required for. 
@@ -44,7 +44,7 @@ As you continue to push your limits, remember:
   - ChatGPT can only remember so many things! Try to be as clear and modular as possible with your asks while providing context where necessary.
 
 - **BE PERSISTENT**  
-  - ChatGPT considerably lessens the learning curve to code; however, it does not take away the learning entirely. Odds are your solution / what you want won't be able to be created in one shot. Be patient and keep trying!
+  - ChatGPT considerably lessens the learning curve to code; however, it does not take away the learning entirely. Odds are that your solution and what you want won't be able to be created in one shot (yet). Be patient and keep trying!
 
 ---
 
